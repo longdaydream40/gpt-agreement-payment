@@ -102,7 +102,8 @@ def rotate_ip(user: str = CurrentUser):
         pass
 
     try:
-        new_px = _rotate_webshare_ip(cfg, team_client=None, prev_ip=prev_ip)
+        # 用户手动按按钮 → 跳过 _rotate_webshare_ip 的冷却（明确意图覆盖节流）
+        new_px = _rotate_webshare_ip(cfg, team_client=None, prev_ip=prev_ip, force=True)
     except WebshareQuotaExhausted as e:
         raise HTTPException(status_code=402, detail=f"Webshare 替换额度耗尽: {e}")
     except RuntimeError as e:

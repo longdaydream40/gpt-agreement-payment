@@ -85,6 +85,62 @@ def test_proxy_rotate_calls_pipeline_helper(client, tmp_path, monkeypatch):
     assert body["country"] == "ID"
 
 
+def test_rotate_webshare_ip_cooldown_returns_cached(monkeypatch):
+    """冷却内重复调 _rotate_webshare_ip 直接返回上次结果，不查 Webshare API。"""
+    import sys, time
+    sys.path.insert(0, "/home/kali/gpt-mitm-public")
+    import pipeline as pl
+
+    cached = {"proxy_address": "1.1.1.1", "port": 1, "country_code": "ID",
+              "asn_name": "Cached ASN", "valid": True,
+              "username": "u", "password": "p"}
+    monkeypatch.setattr(pl, "_LAST_ROTATE_TS", time.time())
+    monkeypatch.setattr(pl, "_LAST_ROTATE_PX", cached)
+
+    # 让 WebshareClient 调用炸 — 确保我们没穿透到 API
+    class Boom:
+        def __init__(self, *a, **kw): raise AssertionError("不该实例化 client")
+    monkeypatch.setattr(pl, "WebshareClient", Boom)
+
+    cfg = {"webshare": {"enabled": True, "api_key": "fake",
+                          "rotate_cooldown_s": 300}}
+    out = pl._rotate_webshare_ip(cfg, team_client=None)
+    assert out is cached
+
+
+def test_rotate_webshare_ip_force_bypasses_cooldown(monkeypatch):
+    """force=True 跳过冷却，仍触发完整 refresh 流程。"""
+    import sys, time
+    sys.path.insert(0, "/home/kali/gpt-mitm-public")
+    import pipeline as pl
+
+    cached = {"proxy_address": "1.1.1.1", "port": 1, "valid": True,
+              "username": "u", "password": "p"}
+    monkeypatch.setattr(pl, "_LAST_ROTATE_TS", time.time())
+    monkeypatch.setattr(pl, "_LAST_ROTATE_PX", cached)
+
+    new_px = {"proxy_address": "2.2.2.2", "port": 2, "country_code": "US",
+              "asn_name": "Fresh", "valid": True,
+              "username": "u2", "password": "p2"}
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        def get_replacement_quota(self):
+            return {"available": 50, "total": 100, "used": 50}
+        def refresh_pool(self, country=""): pass
+        def wait_for_fresh_proxy(self, prev_ip="", max_wait_s=120):
+            return new_px
+
+    monkeypatch.setattr(pl, "WebshareClient", FakeClient)
+    monkeypatch.setattr(pl, "_swap_gost_relay", lambda *a, **kw: None)
+
+    cfg = {"webshare": {"enabled": True, "api_key": "fake",
+                          "rotate_cooldown_s": 300}}
+    out = pl._rotate_webshare_ip(cfg, team_client=None, force=True)
+    assert out is new_px
+    assert pl._LAST_ROTATE_PX is new_px
+
+
 def test_proxy_rotate_returns_402_on_quota_exhausted(client, tmp_path, monkeypatch):
     _login(client)
     _write_pay_cfg(monkeypatch, tmp_path, {"enabled": True, "api_key": "fake"})

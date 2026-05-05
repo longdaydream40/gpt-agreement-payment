@@ -2556,10 +2556,20 @@ def _swap_gost_relay(new_ip: str, new_port: int, username: str, password: str,
                               stdin=subprocess.DEVNULL, start_new_session=True)
     finally:
         os.close(fd)
-    time.sleep(1.5)
+    time.sleep(0.5)
     if p.poll() is not None:
         raise RuntimeError(f"gost 启动即退出，见 {log_path}")
-    print(f"[gost] 启动新中继 PID={p.pid}  {upstream}")
+    # 同步验证上游真能通——避免"代码已轮 IP，gost 还冷启"窗口里调用方
+    # 第一个请求踩 SOCKS5 失败被误归到 proxy_dead → 又触发轮换的螺旋。
+    settle_deadline = time.time() + 15
+    while time.time() < settle_deadline:
+        if _probe_gost_upstream(listen_port, timeout_s=3):
+            print(f"[gost] 启动新中继 PID={p.pid}  {upstream}  (探活通过)")
+            return
+        time.sleep(0.5)
+    raise RuntimeError(
+        f"gost 启动后 15s 探活仍失败，IP={new_ip}:{new_port}（见 {log_path}）"
+    )
 
 
 def _probe_gost_upstream(listen_port: int, timeout_s: int = 5) -> bool:
@@ -2638,8 +2648,20 @@ def _ensure_gost_alive(card_cfg: dict, team_client=None) -> bool:
     return True
 
 
-def _rotate_webshare_ip(card_cfg: dict, team_client=None, prev_ip: str = "") -> dict:
-    """整合：refresh → 轮询新 IP → 换 gost → 同步 team 全局代理。返回新 proxy dict。"""
+# Rotate 冷却：模块级时间戳 + 上次结果缓存。任何调用方（auto-loop 分类 /
+# pipeline._ensure_gost_alive / 手动 /api/proxy/rotate-ip）共享，避免短时间内
+# 重复 refresh 烧 Webshare 配额。冷却内的调用直接返回上次 IP，不查 API。
+_LAST_ROTATE_TS: float = 0.0
+_LAST_ROTATE_PX: dict | None = None
+
+
+def _rotate_webshare_ip(card_cfg: dict, team_client=None, prev_ip: str = "",
+                          force: bool = False) -> dict:
+    """整合：refresh → 轮询新 IP → 换 gost → 同步 team 全局代理。返回新 proxy dict。
+
+    cooldown 由 cardw.webshare.rotate_cooldown_s 控制（默认 300s）；
+    传 force=True 跳过冷却（手动按钮 /api/proxy/rotate-ip 用得着）。"""
+    global _LAST_ROTATE_TS, _LAST_ROTATE_PX
     ws_cfg = (card_cfg or {}).get("webshare") or {}
     if not ws_cfg.get("enabled"):
         raise RuntimeError("webshare 未启用")
@@ -2651,6 +2673,16 @@ def _rotate_webshare_ip(card_cfg: dict, team_client=None, prev_ip: str = "") -> 
     team_scheme = str(ws_cfg.get("team_proxy_scheme", "socks5"))
     sync_team = bool(ws_cfg.get("sync_team_proxy", True))
     poll_wait = int(ws_cfg.get("poll_timeout_s", 120))
+    cooldown = int(ws_cfg.get("rotate_cooldown_s", 300))
+
+    if not force and cooldown > 0 and _LAST_ROTATE_PX:
+        elapsed = time.time() - _LAST_ROTATE_TS
+        if elapsed < cooldown:
+            print(
+                f"[Webshare] 距上次 rotate {elapsed:.0f}s < 冷却 {cooldown}s，"
+                f"跳过新 refresh（沿用 IP={_LAST_ROTATE_PX.get('proxy_address')}）"
+            )
+            return _LAST_ROTATE_PX
 
     client = WebshareClient(api_key)
     try:
@@ -2688,6 +2720,8 @@ def _rotate_webshare_ip(card_cfg: dict, team_client=None, prev_ip: str = "") -> 
         except Exception as e:
             print(f"[Team] 更新全局代理失败: {e}")
 
+    _LAST_ROTATE_TS = time.time()
+    _LAST_ROTATE_PX = new_px
     return new_px
 
 
