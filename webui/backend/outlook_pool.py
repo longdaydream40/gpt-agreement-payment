@@ -15,6 +15,10 @@ import re
 import time
 import urllib.parse
 import urllib.request
+from email.header import decode_header
+from email.message import Message
+from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from typing import Optional
 
 from .db import get_db
@@ -23,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 GRAPH_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 IMAP_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+GRAPH_MAIL_SCOPE = "https://graph.microsoft.com/Mail.Read offline_access"
 IMAP_HOST = "outlook.office365.com"
 
 
@@ -387,12 +392,12 @@ def delete(email: str) -> bool:
 # ──────────────────────── outlook IMAP OAuth2 fetch OTP ────────────────────────
 
 
-def get_outlook_access_token(refresh_token: str, client_id: str) -> str:
+def get_outlook_access_token(refresh_token: str, client_id: str, scope: str = IMAP_SCOPE) -> str:
     body = urllib.parse.urlencode({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": client_id,
-        "scope": IMAP_SCOPE,
+        "scope": scope,
     }).encode()
     req = urllib.request.Request(GRAPH_TOKEN_URL, data=body)
     resp = urllib.request.urlopen(req, timeout=15)
@@ -407,6 +412,60 @@ def _is_hex_color_context(haystack: str, idx: int) -> bool:
         return True
     before = haystack[max(0, idx - 30):idx]
     return bool(re.search(r"(?:color|background|bgcolor|fill|stroke)\s*[:=]\s*[\"']?#?\s*$", before, re.IGNORECASE))
+
+
+class _HtmlToText(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        return " ".join(self.parts)
+
+
+def _decode_mime_header(value: str) -> str:
+    parts: list[str] = []
+    for raw, charset in decode_header(value or ""):
+        if isinstance(raw, bytes):
+            parts.append(raw.decode(charset or "utf-8", errors="replace"))
+        else:
+            parts.append(raw)
+    return "".join(parts)
+
+
+def _message_timestamp(msg: Message) -> float:
+    try:
+        return parsedate_to_datetime(msg.get("Date") or "").timestamp()
+    except Exception:
+        return 0.0
+
+
+def _message_body_text(msg: Message) -> str:
+    chunks: list[str] = []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        if part.get_content_type() not in ("text/plain", "text/html"):
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        text = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+        if part.get_content_type() == "text/html":
+            parser = _HtmlToText()
+            parser.feed(text)
+            text = parser.text()
+        chunks.append(text)
+    return "\n".join(chunks)
+
+
+def _quote_mailbox(name: str) -> str:
+    escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _extract_otp_from_html(body: str) -> Optional[str]:
@@ -424,7 +483,26 @@ def _extract_otp_from_html(body: str) -> Optional[str]:
     return None
 
 
-def fetch_otp_via_imap(email: str, refresh_token: str, client_id: str,
+def _extract_otp_from_html(body: str) -> Optional[str]:
+    for pat in (
+        r"(?:otp|one[-\s]*time|verification|verify|code|passcode|security|login|confirm|"
+        r"kode|verifikasi)[^\d]{0,120}(\d{4,8})(?!\d)",
+        r"(?<!\d)(\d{4,8})(?!\d)[^\n\r]{0,120}(?:otp|one[-\s]*time|verification|"
+        r"verify|code|passcode|security|login|confirm|kode|verifikasi)",
+        r"chatgpt[^\d]{0,120}(\d{4,8})(?!\d)",
+        r"openai[^\d]{0,120}(\d{4,8})(?!\d)",
+    ):
+        for match in re.finditer(pat, body or "", re.IGNORECASE | re.DOTALL):
+            code = re.sub(r"\D", "", match.group(1))
+            if 4 <= len(code) <= 8 and not _is_hex_color_context(body, match.start(1)):
+                return code
+    for match in re.finditer(r"(?<!\d)(\d{6})(?!\d)", body or ""):
+        if not _is_hex_color_context(body, match.start(1)):
+            return match.group(1)
+    return None
+
+
+def _fetch_otp_via_imap_old(email: str, refresh_token: str, client_id: str,
                        timeout: int = 240, threshold_ts: float = 0) -> str:
     """阻塞拉 outlook OTP（OpenAI 来的最新邮件）。返回 6 位 OTP 或抛 TimeoutError。
 
@@ -569,3 +647,202 @@ def fetch_otp_via_imap(email: str, refresh_token: str, client_id: str,
             logger.warning(f"[outlook-pool] fetch_otp 异常 (吃掉重试): {e}")
         time.sleep(4)
     raise TimeoutError(f"outlook OTP timeout {timeout}s for {email}")
+
+
+def fetch_otp_via_imap(email: str, refresh_token: str, client_id: str,
+                       timeout: int = 240, threshold_ts: float = 0) -> str:
+    """Read the newest OpenAI OTP mail from Outlook via IMAP XOAUTH2.
+
+    Each polling round fetches only the latest message from each likely folder,
+    then picks the newest OpenAI candidate globally. This matches the current
+    operational requirement: use the most recent mailbox message, not a wider
+    historical scan that can select stale OTPs.
+    """
+    import email as _email
+
+    try:
+        otp = fetch_otp_via_graph(email, refresh_token, client_id, threshold_ts=threshold_ts)
+        if otp:
+            return otp
+        logger.info(f"[outlook-pool] Graph returned no OpenAI OTP for {email}; falling back to IMAP")
+    except Exception as exc:
+        logger.warning(f"[outlook-pool] Graph fetch failed for {email}; falling back to IMAP: {exc}")
+
+    deadline = time.time() + max(60, timeout)
+    if not threshold_ts:
+        threshold_ts = time.time() - 300
+
+    cached_token = ""
+    cached_at = 0.0
+    folders_to_scan = ["INBOX", "Junk", "Junk Email", "Spam"]
+    found_folders: list[str] | None = None
+    seen: set[tuple[str, bytes]] = set()
+
+    while time.time() < deadline:
+        conn = None
+        try:
+            if not cached_token or time.time() - cached_at > 3000:
+                cached_token = get_outlook_access_token(refresh_token, client_id)
+                cached_at = time.time()
+
+            conn = imaplib.IMAP4_SSL(IMAP_HOST, 993)
+            auth_string = f"user={email}\x01auth=Bearer {cached_token}\x01\x01"
+            typ, _ = conn.authenticate("XOAUTH2", lambda _: auth_string.encode())
+            if typ != "OK":
+                raise RuntimeError("imap XOAUTH2 failed")
+
+            if found_folders is None:
+                found_folders = _discover_outlook_folders(conn, folders_to_scan)
+                logger.info(f"[outlook-pool] {email} folders to scan: {found_folders}")
+
+            candidates: list[tuple[float, str, str, Message, str]] = []
+            for folder in found_folders:
+                try:
+                    typ, _ = conn.select(_quote_mailbox(folder), readonly=True)
+                    if typ != "OK":
+                        continue
+                    typ, data = conn.uid("SEARCH", None, "ALL")
+                    uids = data[0].split() if typ == "OK" and data and data[0] else []
+                    if not uids:
+                        continue
+                    raw_uid = uids[-1]
+                    key = (folder, raw_uid)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    typ, raw = conn.uid("FETCH", raw_uid, "(BODY.PEEK[])")
+                    if typ != "OK" or not raw or not raw[0]:
+                        continue
+                    msg = _email.message_from_bytes(raw[0][1])
+                    uid = raw_uid.decode("ascii", errors="replace")
+                    sender = _decode_mime_header(msg.get("From") or "")
+                    candidates.append((_message_timestamp(msg), folder, uid, msg, sender))
+                except Exception as exc:
+                    logger.debug(f"[outlook-pool] latest fetch skipped folder={folder}: {exc}")
+
+            for msg_ts, folder, uid, msg, sender in sorted(
+                candidates, key=lambda item: item[0], reverse=True
+            ):
+                if msg_ts and msg_ts < threshold_ts:
+                    continue
+                from_field = sender.lower()
+                if not any(d in from_field for d in (
+                    "openai.com", "auth.openai", "tm.openai", "chatgpt.com", "tm.open",
+                )):
+                    logger.debug(f"[outlook-pool] skip latest non-OpenAI from={from_field[:80]}")
+                    continue
+                if "tm1.openai" in from_field:
+                    logger.info(
+                        f"[outlook-pool] skip tm1.openai.com shadow mail: uid={uid} from={from_field[:60]}"
+                    )
+                    continue
+                subject = _decode_mime_header(msg.get("Subject") or "")
+                body = _message_body_text(msg)
+                otp = _extract_otp_from_html(f"{subject}\n{body}")
+                if otp:
+                    logger.info(
+                        f"[outlook-pool] {email} OTP hit folder={folder!r} uid={uid} "
+                        f"msg_ts={int(msg_ts)} otp={otp}"
+                    )
+                    return otp
+        except Exception as exc:
+            logger.warning(f"[outlook-pool] fetch_otp retry after error: {exc}")
+        finally:
+            if conn is not None:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+        time.sleep(4)
+
+    raise TimeoutError(f"outlook OTP timeout {timeout}s for {email}")
+
+
+def _discover_outlook_folders(conn: imaplib.IMAP4_SSL, requested: list[str]) -> list[str]:
+    try:
+        typ, listing = conn.list()
+    except Exception:
+        return list(requested)
+    if typ != "OK" or not listing:
+        return list(requested)
+
+    names_lower: dict[str, str] = {}
+    for raw in listing:
+        if not raw:
+            continue
+        line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+        match = re.search(r'"([^"]+)"\s*$', line) or re.search(r"\s(\S+)\s*$", line)
+        if match:
+            name = match.group(1).strip('"')
+            names_lower[name.lower()] = name
+
+    picked: list[str] = []
+    for folder in requested:
+        real = names_lower.get(folder.lower())
+        if real and real not in picked:
+            picked.append(real)
+    for key, real in names_lower.items():
+        if any(token in key for token in ("junk", "spam", "bulk")) and real not in picked:
+            picked.append(real)
+    if "INBOX" not in picked:
+        picked.insert(0, "INBOX")
+    return picked
+
+
+def fetch_otp_via_graph(email: str, refresh_token: str, client_id: str,
+                        threshold_ts: float = 0) -> str:
+    """Fetch OTP from the newest Graph-visible Inbox/Junk messages over HTTPS."""
+    token = get_outlook_access_token(refresh_token, client_id, scope=GRAPH_MAIL_SCOPE)
+    folders = ("inbox", "junkemail")
+    candidates: list[tuple[float, str, dict]] = []
+
+    for folder in folders:
+        query = urllib.parse.urlencode({
+            "$top": "1",
+            "$orderby": "receivedDateTime desc",
+            "$select": "id,subject,from,receivedDateTime,bodyPreview,body",
+        })
+        url = f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder}/messages?{query}"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        for item in data.get("value") or []:
+            ts = 0.0
+            raw_ts = str(item.get("receivedDateTime") or "")
+            if raw_ts:
+                try:
+                    ts = parsedate_to_datetime(raw_ts.replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    try:
+                        from datetime import datetime
+                        ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        ts = 0.0
+            candidates.append((ts, folder, item))
+
+    for ts, folder, item in sorted(candidates, key=lambda entry: entry[0], reverse=True):
+        if threshold_ts and ts and ts < threshold_ts:
+            continue
+        sender = ((item.get("from") or {}).get("emailAddress") or {}).get("address", "")
+        sender_name = ((item.get("from") or {}).get("emailAddress") or {}).get("name", "")
+        from_field = f"{sender_name} <{sender}>".lower()
+        if not any(d in from_field for d in (
+            "openai.com", "auth.openai", "tm.openai", "chatgpt.com", "tm.open",
+        )):
+            continue
+        if "tm1.openai" in from_field:
+            continue
+        subject = str(item.get("subject") or "")
+        body = item.get("body") or {}
+        body_text = str(body.get("content") or item.get("bodyPreview") or "")
+        otp = _extract_otp_from_html(f"{subject}\n{body_text}")
+        if otp:
+            logger.info(
+                f"[outlook-pool] {email} Graph OTP hit folder={folder!r} "
+                f"msg_ts={int(ts)} otp={otp}"
+            )
+            return otp
+    return ""
